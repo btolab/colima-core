@@ -9,6 +9,10 @@ on:
 
 permissions: write-all
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   UBUNTU_CODENAME: noble
   UBUNTU_VERSION: "24.04"
