@@ -1,0 +1,11 @@
+issuer: https://token.actions.githubusercontent.com
+subject: repo:btolab/colima-core:ref:refs/heads/main
+
+permissions:
+  checks: write
+  contents: write
+  issues: write
+  members: read
+  pull_requests: write
+  statuses: write
+  workflows: write

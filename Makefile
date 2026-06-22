@@ -1,5 +1,7 @@
 # image and tool versions
 include dependencies.env
+FLANNEL_MINI_VERSION = $(shell echo "$(FLANNEL_VERSION)" | sed 's/-flannel[0-9]*//')
+BINFMT_QEMU_VERSION = $(shell echo "$(BINFMT_VERSION)" | sed 's|deploy/v||;s/-[0-9]*$$//')
 
 # runtime
 RUNTIME ?= docker
