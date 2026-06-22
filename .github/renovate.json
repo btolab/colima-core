@@ -17,7 +17,9 @@
   "customManagers": [
     {
       "customType": "regex",
-      "fileMatch": ["^dependencies\\.env$"],
+      "managerFilePatterns": [
+        "/^dependencies\\.env$/"
+      ],
       "matchStrings": ["DOCKER_VERSION=\"(?<currentValue>[^\"]+)\""],
       "depNameTemplate": "moby/moby",
       "datasourceTemplate": "github-releases",
@@ -25,7 +27,9 @@
     },
     {
       "customType": "regex",
-      "fileMatch": ["^dependencies\\.env$"],
+      "managerFilePatterns": [
+        "/^dependencies\\.env$/"
+      ],
       "matchStrings": ["NERDCTL_VERSION=\"(?<currentValue>[^\"]+)\""],
       "depNameTemplate": "containerd/nerdctl",
       "datasourceTemplate": "github-releases",
@@ -33,7 +37,9 @@
     },
     {
       "customType": "regex",
-      "fileMatch": ["^dependencies\\.env$"],
+      "managerFilePatterns": [
+        "/^dependencies\\.env$/"
+      ],
       "matchStrings": ["FLANNEL_VERSION=\"(?<currentValue>[^\"]+)\""],
       "depNameTemplate": "flannel-io/cni-plugin",
       "datasourceTemplate": "github-releases",
@@ -42,7 +48,9 @@
     },
     {
       "customType": "regex",
-      "fileMatch": ["^dependencies\\.env$"],
+      "managerFilePatterns": [
+        "/^dependencies\\.env$/"
+      ],
       "matchStrings": ["BINFMT_VERSION=\"(?<currentValue>[^\"]+)\""],
       "depNameTemplate": "tonistiigi/binfmt",
       "datasourceTemplate": "github-tags",
