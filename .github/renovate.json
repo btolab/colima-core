@@ -1,0 +1,60 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices",
+    "helpers:pinGitHubActionDigestsToSemver"
+  ],
+  "minimumReleaseAge": "1 day",
+  "prHourlyLimit": 0,
+  "automergeType": "pr",
+  "packageRules": [
+    {
+      "description": "Automerge safe updates (patch) plus digest updates once checks pass",
+      "matchUpdateTypes": ["patch", "digest"],
+      "automerge": true
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^dependencies\\.env$/"
+      ],
+      "matchStrings": ["DOCKER_VERSION=\"(?<currentValue>[^\"]+)\""],
+      "depNameTemplate": "moby/moby",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^dependencies\\.env$/"
+      ],
+      "matchStrings": ["NERDCTL_VERSION=\"(?<currentValue>[^\"]+)\""],
+      "depNameTemplate": "containerd/nerdctl",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^dependencies\\.env$/"
+      ],
+      "matchStrings": ["FLANNEL_VERSION=\"(?<currentValue>[^\"]+)\""],
+      "depNameTemplate": "flannel-io/cni-plugin",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.+)$",
+      "versioningTemplate": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-flannel(?<build>\\d+)$"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^dependencies\\.env$/"
+      ],
+      "matchStrings": ["BINFMT_VERSION=\"(?<currentValue>[^\"]+)\""],
+      "depNameTemplate": "tonistiigi/binfmt",
+      "datasourceTemplate": "github-tags",
+      "versioningTemplate": "regex:^deploy/v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-(?<build>\\d+)$"
+    }
+  ]
+}
