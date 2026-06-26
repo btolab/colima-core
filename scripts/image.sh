@@ -6,35 +6,57 @@ set -eux
 export DEBIAN_FRONTEND=noninteractive
 
 # external variables that must be set
-echo vars: $ARCH $BINFMT_ARCH $UBUNTU_VERSION $DOCKER_VERSION $RUNTIME
+echo vars: $DOCKER_VERSION $RUNTIME
 
-FILENAME="ubuntu-${UBUNTU_VERSION}-minimal-cloudimg-${ARCH}"
-
-SCRIPT_DIR=$(realpath "$(dirname "$(dirname $0)")")
-IMG_DIR="$SCRIPT_DIR/dist/img"
+BUILD_DIR="/build"
 CHROOT_DIR=/mnt/colima-img
 
-FILE="$IMG_DIR/$FILENAME"
-
-install_dependencies() (
-	apt-get update
-	apt-get install -y file fdisk libdigest-sha-perl qemu-utils
-)
+IMAGE_FILE="${BUILD_DIR}/${IMAGE_FILE}"
+RAW_FILE="${IMAGE_FILE%.*}-${RUNTIME}.raw"
 
 convert_file() (
-	qemu-img convert -p -f qcow2 -O raw $FILE.img $FILE.raw
+	qemu-img convert -p -f qcow2 -O raw "${IMAGE_FILE}" "${RAW_FILE}"
 )
 
-extract_partition_offset() (
-	fdisk -l $FILE.raw | grep "$FILE.raw1 " | awk -F' ' '{print $2}'
-)
-
-mount_partition() (
+mount_partition() {
+	LOOP_DEV=$(losetup -Pf --show "${RAW_FILE}")
+	kpartx -avs "$LOOP_DEV"
+	LOOP_NAME=$(basename "$LOOP_DEV")
+	ROOT_PART="/dev/mapper/${LOOP_NAME}p1"
+	ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+	mkdir -p "/dev/disk/by-uuid"
+	ln -s "/dev/mapper/${LOOP_NAME}p1" "/dev/disk/by-uuid/$ROOT_UUID"
 	mkdir -p $CHROOT_DIR
-	mount -o loop,offset=$(($1 * 512)) $FILE.raw $CHROOT_DIR
-)
+
+	mount "$ROOT_PART" "$CHROOT_DIR"
+	mount --bind /proc "$CHROOT_DIR/proc"
+	mount --bind /dev "$CHROOT_DIR/dev"
+	mount --bind /sys "$CHROOT_DIR/sys"
+	chroot_exec mount -t devpts devpts /dev/pts
+}
+
+cleanup() {
+	rm -f "${RAW_FILE}"
+	if [ -n "$CHROOT_DIR" ] && mountpoint -q "$CHROOT_DIR"; then
+		unmount_partition ||:
+	fi
+	if [ -n "$ROOT_UUID" ] && [ -h "/dev/disk/by-uuid/$ROOT_UUID" ]; then
+		rm -f "/dev/disk/by-uuid/$ROOT_UUID"
+	fi
+	if [ -n "$LOOP_DEV" ]; then
+		kpartx -dvs "$LOOP_DEV" 2>/dev/null || true
+	fi
+	if [ -n "$LOOP_DEV" ] && losetup "$LOOP_DEV" >/dev/null 2>&1; then
+		losetup -d "$LOOP_DEV"
+	fi
+}
+trap 'cleanup' EXIT
 
 unmount_partition() (
+	umount $CHROOT_DIR/sys
+	umount $CHROOT_DIR/dev/pts
+	umount $CHROOT_DIR/dev
+	umount $CHROOT_DIR/proc
 	umount $CHROOT_DIR
 )
 
@@ -42,26 +64,83 @@ chroot_exec() (
 	chroot $CHROOT_DIR "$@"
 )
 
+apt_update_source() {
+	chroot_exec apt-get -qq update -y -o Dir::Etc::sourcelist="sources.list.d/${1}" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0"
+}
+
+apt_keyring_zabbly() {
+	test -f "$CHROOT_DIR/etc/apt/keyrings/zabbly.asc" || {
+		chroot_exec install -m 0755 -d /etc/apt/keyrings
+		chroot_exec curl -fsSLo zabbly.asc https://pkgs.zabbly.com/key.asc
+		chroot_exec install -m 0644 zabbly.asc /etc/apt/keyrings/zabbly.asc
+		chroot_exec rm -f zabbly.asc
+	}
+}
+
+apt_source_zabbly_incus() {
+	apt_keyring_zabbly
+	chroot_exec sh -c 'cat <<EOF > /etc/apt/sources.list.d/zabbly-incus-stable.sources
+Enabled: yes
+Types: deb
+URIs: https://pkgs.zabbly.com/incus/stable
+Suites: $(. /etc/os-release && echo ${VERSION_CODENAME})
+Components: main
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/zabbly.asc
+EOF'
+	apt_update_source zabbly-incus-stable.sources
+}
+
+apt_source_zabbly_kernel() {
+	apt_keyring_zabbly
+	chroot_exec sh -c 'cat <<EOF > /etc/apt/sources.list.d/zabbly-kernel-stable.sources
+Enabled: yes
+Types: deb
+URIs: https://pkgs.zabbly.com/kernel/stable
+Suites: $(. /etc/os-release && echo ${VERSION_CODENAME})
+Components: main
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/zabbly.asc
+EOF'
+	apt_update_source zabbly-kernel-stable.sources
+}
+
 install_packages() (
-	# necessary
-	chroot_exec mount -t proc proc /proc
-	chroot_exec mount -t devpts devpts /dev/pts
+	echo 'Dpkg::Use-Pty "0"; Dpkg::Progress-Fancy="0";' > $CHROOT_DIR/etc/apt/apt.conf.d/colima
+	DPKG_ARCH=$(chroot_exec dpkg --print-architecture)
 
 	# internet
 	chroot_exec mv /etc/resolv.conf /etc/resolv.conf.bak
 	echo 'nameserver 1.1.1.1' >$CHROOT_DIR/etc/resolv.conf
 
+	# minimal
+	echo 'Binary::apt::APT::Keep-Downloaded-Packages "0";' > $CHROOT_DIR/etc/apt/apt.conf.d/01_nocache
+	echo 'APT::Install-Recommends "0"; APT::Install-Suggests "0"; Acquire::Retries "5";' >> $CHROOT_DIR/etc/apt/apt.conf.d/colima
+	if [ "${DIST}" == "debian" ] ; then
+		chroot_exec sed -i 's/Components: main$/Components: main contrib non-free-firmware/' /etc/apt/sources.list.d/debian.sources
+		chroot_exec apt-get -qq purge -y groff-base man-db manpages
+	fi
+	cat >$CHROOT_DIR/etc/dpkg/dpkg.cfg.d/01_nodoc <<"EOF"
+path-exclude=/usr/share/locale/*;
+path-exclude=/usr/share/man/*;
+path-exclude=/usr/share/doc/*;
+path-include=/usr/share/doc/*/copyright;
+EOF
+	pushd $CHROOT_DIR
+	find usr/share/doc/ usr/share/man usr/share/locale/ -mindepth 1 -delete
+	popd
+
 	# prepare packages
-	chroot_exec apt-get update
+	chroot_exec apt-get -qq update
 
 	# packages common to all runtimes, to prevent from final purging
-	chroot_exec apt-get install -y iptables socat sshfs cloud-init lsb-release python3-apt gnupg curl wget dnsmasq
+	chroot_exec apt-get -qq install -y iptables socat sshfs cloud-init lsb-release python3-apt gnupg curl wget dnsmasq
+	chroot_exec apt-get -qq install -y htop inetutils-ping dnsutils net-tools netcat-openbsd telnet vim-tiny nano
 
 	# none
 	if [ "$RUNTIME" == "none" ]; then
 		(
-			chroot_exec apt-get install -y htop inetutils-ping dnsutils net-tools netcat-openbsd telnet vim-tiny nano
-			chroot_exec apt-get purge -y dmsetup xz-utils
+			chroot_exec apt-get -qq purge -y xz-utils
 		)
 	fi
 
@@ -72,7 +151,7 @@ install_packages() (
 			chroot_exec sh /tmp/get-docker.sh --version $DOCKER_VERSION
 			chroot_exec rm /tmp/get-docker.sh
 			chroot_exec apt-mark hold docker-ce docker-ce-cli containerd.io
-			chroot_exec apt-get purge -y dmsetup xz-utils
+			chroot_exec apt-get -qq purge -y xz-utils
 		)
 	fi
 
@@ -80,37 +159,48 @@ install_packages() (
 	if [ "$RUNTIME" == "containerd" ]; then
 		(
 			cd /tmp
-			tar Cxfz ${CHROOT_DIR}/usr/local /build/dist/containerd/containerd-utils-${ARCH}.tar.gz
+			tar Cxfz ${CHROOT_DIR}/usr/local "${BUILD_DIR}/${CONTAINERD_ARCHIVE}"
 			chroot_exec mkdir -p /opt/cni
 			chroot_exec mv /usr/local/libexec/cni /opt/cni/bin
-			chroot_exec apt-get purge -y dmsetup xz-utils
+			chroot_exec apt-get -qq purge -y xz-utils
 		)
 	fi
 
 	# incus
 	if [ "$RUNTIME" == "incus" ]; then
 		(
-			chroot_exec mkdir -p /etc/apt/keyrings/
-			chroot_exec curl -fsSL https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc
-			chroot_exec sh -c 'cat <<EOF > /etc/apt/sources.list.d/zabbly-incus-stable.sources
-Enabled: yes
-Types: deb
-URIs: https://pkgs.zabbly.com/incus/stable
-Suites: $(. /etc/os-release && echo ${VERSION_CODENAME})
-Components: main
-Architectures: $(dpkg --print-architecture)
-Signed-By: /etc/apt/keyrings/zabbly.asc
+			apt_source_zabbly_incus
 
-EOF'
-			chroot_exec apt-get update
-			chroot_exec apt-get install -y htop inetutils-ping dnsutils net-tools netcat-openbsd telnet vim-tiny nano
-			chroot_exec apt-get install -y incus incus-base incus-client incus-extra incus-ui-canonical zfsutils-linux btrfs-progs lvm2 thin-provisioning-tools
-			chroot_exec apt-mark hold incus incus-base incus-client incus-extra incus-ui-canonical zfsutils-linux btrfs-progs lvm2 thin-provisioning-tools
+			if [ "${DIST}" == "debian" ] ; then
+				chroot_exec apt-get -qq install -y dpkg-dev "linux-headers-cloud-${DPKG_ARCH}"
+				chroot_exec apt-get -qq install -y zfs-dkms
+			fi
+
+			chroot_exec apt-get -qq install -y incus incus-base incus-client incus-extra incus-ui-canonical zfsutils-linux btrfs-progs lvm2 thin-provisioning-tools nftables
+			chroot_exec apt-mark hold incus incus-base incus-client incus-extra incus-ui-canonical zfsutils-linux btrfs-progs lvm2 thin-provisioning-tools nftables
 		)
 	fi
 
-	chroot_exec apt-get purge -y apport console-setup-linux dbus-user-session liblocale-gettext-perl lxd-agent-loader lxd-installer parted pciutils pollinate python3-gi snapd ssh-import-id
-	chroot_exec apt-get purge -y ubuntu-advantage-tools ubuntu-cloud-minimal ubuntu-drivers-common ubuntu-release-upgrader-core unattended-upgrades systemd-resolved
+	chroot_exec apt-get -qq purge -y apport console-setup-linux dbus-user-session liblocale-gettext-perl parted pciutils pollinate python3-gi snapd ssh-import-id
+	chroot_exec apt-get -qq purge -y unattended-upgrades systemd-resolved
+	chroot_exec apt-get -qq purge -y apt-listchanges apt-utils reportbug screen whiptail xml-core
+	chroot_exec apt-get -qq purge -y bash-completion
+
+	if [ "$DIST" == "ubuntu" ] ; then
+		chroot_exec apt-get -qq purge -y lxd-agent-loader lxd-installer ubuntu-advantage-tools ubuntu-cloud-minimal ubuntu-drivers-common ubuntu-release-upgrader-core
+	fi
+
+	# cleanup any old kernel versions that may be been upgraded
+	KERNEL_VERSIONS=$(chroot_exec dpkg-query -W -f='${Package}\n' | grep -E '^linux-image-[0-9]' | sed 's/^linux-image-//' | sort -V)
+	LATEST_VERSION=$(echo "$KERNEL_VERSIONS" | tail -n 1)
+	for V in $KERNEL_VERSIONS; do
+		if [ "$V" != "$LATEST_VERSION" ]; then
+			chroot_exec apt-get -qq purge -y "linux-image-$V"
+			chroot_exec apt-get -qq purge -y "linux-headers-$V" ||:
+			chroot_exec apt-get -qq purge -y "linux-modules-$V" ||:
+			chroot_exec apt-get -qq purge -y "linux-modules-extra-$V" ||:
+		fi
+	done
 
 	chroot_exec apt-get autoremove -y
 	chroot_exec apt-get clean -y
@@ -119,10 +209,21 @@ EOF'
 	# binfmt
 	(
 		cd /tmp
-		tar xfz /build/dist/binfmt/binfmt-${ARCH}.tar.gz
-		chown root:root binfmt qemu-i386 qemu-${BINFMT_ARCH}
-		mv binfmt qemu-i386 qemu-${BINFMT_ARCH} ${CHROOT_DIR}/usr/bin
+		tar xfz "${BUILD_DIR}/${BINFMT_ARCHIVE}"
+		chown root:root binfmt qemu-*
+		mv binfmt qemu-* ${CHROOT_DIR}/usr/bin
 	)
+
+	# console messages to lima serial log
+	echo "virtio_console" >> $CHROOT_DIR/etc/initramfs-tools/modules
+	chroot_exec update-initramfs -k all -u
+	mkdir -p $CHROOT_DIR/etc/default/grub.d
+	cat >"$CHROOT_DIR"/etc/default/grub.d/99-lima-console.cfg <<"EOF"
+GRUB_TERMINAL="serial console"
+GRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"
+GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX console=ttyS0 console=hvc0"
+EOF
+	chroot_exec update-grub
 
 	# enable vsock modules at boot
 	cat >${CHROOT_DIR}/etc/modules-load.d/vsock.conf <<EOF
@@ -130,30 +231,31 @@ vsock
 virtio_vsock
 EOF
 
+	# logging to console
+	chroot_exec passwd -d root
+	sed -i -e 's/#\(Storage\)=.*/\1=volatile/' \
+	    -e 's/#\(RuntimeMaxUse\)=.*/100M/' \
+	    -e 's/#\(ForwardToConsole\)=.*/\1=yes/' $CHROOT_DIR/etc/systemd/journald.conf
+
 	# clean traces
-	chroot_exec rm /etc/resolv.conf
-	chroot_exec mv /etc/resolv.conf.bak /etc/resolv.conf
-	chroot_exec umount /dev/pts
-	chroot_exec umount /proc
+	chroot_exec find /tmp -mindepth 1 -delete
+	chroot_exec mv -f /etc/resolv.conf.bak /etc/resolv.conf
+	truncate -s 0 $CHROOT_DIR/etc/machine-id
 
 	# fill partition with zeros, to recover space during compression
-	chroot_exec dd if=/dev/zero of=/root/zero || echo done
+	chroot_exec dd if=/dev/zero of=/root/zero ||:
 	chroot_exec rm -f /root/zero
+	chroot_exec fstrim -av
 )
 
 compress_file() (
-	raw_file="${FILE}-${RUNTIME}.raw"
-	mv $FILE.raw $raw_file
-	gzip -9 -n -f $raw_file
-	dir="$(dirname $raw_file)"
-	filename="$(basename $raw_file)"
-	(cd $dir && shasum -a 512 "${filename}.gz" >"${filename}.gz.sha512sum")
+	pigz -9 -n -f "${RAW_FILE}"
+	shasum -a 512 "${RAW_FILE}.gz" >"${RAW_FILE}.gz.sha512sum"
 )
 
 # perform all actions
-install_dependencies
 convert_file
-mount_partition "$(extract_partition_offset)"
+mount_partition
 install_packages
 unmount_partition
 compress_file

@@ -1,7 +1,41 @@
 # image and tool versions
 include dependencies.env
 
+UNAME_S := $(shell uname -s)
+
+to_upper = $(shell echo '$1' | tr '[:lower:]' '[:upper:]')
+
+ifeq ($(MAKE_TERMOUT),)
+  # Make < 4 doesn't set MAKE_TERMOUT
+  INTERACTIVE ?= $(shell [ -t 0 ] && echo 1)
+else
+  INTERACTIVE ?= 1
+endif
+
+ifeq ($(INTERACTIVE),1)
+DOCKER_RUN_ARGS := -i --tty
+endif
+
+ifeq ($(UNAME_S),Darwin)
+    # macOS uses BSD stat
+    PRINT_STATS_CMD = stat -f "%N%n |- %z bytes%n '- %Sm"
+else
+    # Linux (and most others) use GNU stat
+    PRINT_STATS_CMD = stat -c "%N\n |- %s bytes\n '- %y"
+endif
+
+# quiet target commands by default
+ifeq ($(filter $(DEBUG),1 true),)
+MAKEFLAGS += -s
+else
+TARV = v
+endif
+
+# which dist image to build (debian or ubuntu)
+DIST ?= ubuntu
+
 # runtime
+RUNTIMES = docker containerd incus none
 RUNTIME ?= docker
 
 # architecture defaults to the current system's.
@@ -14,7 +48,7 @@ endif
 # is required for Docker and asset downloads.
 ARCH_x86_64 = amd64
 ARCH_aarch64 = arm64
-ARCH = $(shell echo "$(ARCH_$(OS_ARCH))")
+ARCH = $(ARCH_$(OS_ARCH))
 
 # binfmt needs the opposite of OS_ARCH
 BINFMT_ARCH = aarch64
@@ -22,24 +56,160 @@ ifeq ($(strip $(OS_ARCH)),aarch64)
 BINFMT_ARCH = x86_64
 endif
 
+export ARCH
+export BINFMT_ARCH
+
+# containerd
+CONTAINERD_ARCHIVE ?= dist/containerd/containerd-utils-$(ARCH).tar.gz
+NERDCTL_FILE ?= dist/containerd/nerdctl-full-$(NERDCTL_VERSION)-linux-$(ARCH).tar.gz
+NERDCTL_URL ?= https://github.com/containerd/nerdctl/releases/download/v$(NERDCTL_VERSION)/$(notdir $(NERDCTL_FILE))
+FLANNEL_FILE ?= dist/containerd/cni-plugin-flannel-linux-$(ARCH)-v$(FLANNEL_MINI_VERSION).tgz
+FLANNEL_URL ?= https://github.com/flannel-io/cni-plugin/releases/download/v$(FLANNEL_VERSION)/$(notdir $(FLANNEL_FILE))
+
+# binfmt
+BINFMT_ARCHIVE = dist/binfmt/binfmt-$(ARCH).tar.gz
+BINFMT_DOWNLOAD_URL ?= https://github.com/tonistiigi/binfmt/releases/download/$(BINFMT_VERSION)
+BINFMT_FILE ?= dist/binfmt/$(BINFMT_VERSION)/binfmt_linux-$(ARCH).tar.gz
+BINFMT_URL ?= $(BINFMT_DOWNLOAD_URL)/$(notdir $(BINFMT_FILE))
+BINFMT_QEMU_FILE ?= dist/binfmt/$(BINFMT_QEMU_VERSION)/qemu_v$(BINFMT_QEMU_VERSION)_linux-$(ARCH).tar.gz
+BINFMT_QEMU_URL ?= $(BINFMT_DOWNLOAD_URL)/$(notdir $(BINFMT_QEMU_FILE))
+
+# ubuntu
+UBUNTU_IMAGE_BASE_URL ?= https://cloud-images.ubuntu.com/minimal/releases/$(UBUNTU_CODENAME)/release-$(UBUNTU_BUILD)
+UBUNTU_IMAGE_FILE ?= dist/img/ubuntu-$(UBUNTU_VERSION)-minimal-cloudimg-$(ARCH).img
+UBUNTU_IMAGE_SHA_FILE ?= $(UBUNTU_IMAGE_FILE).sha256sum
+
+# debian
+DEBIAN_IMAGE_BASE_URL ?= https://cloud.debian.org/images/cloud/$(DEBIAN_CODENAME)/$(DEBIAN_BUILD)
+DEBIAN_IMAGE_FILE ?= dist/img/debian-$(DEBIAN_VERSION)-genericcloud-$(ARCH)-$(DEBIAN_BUILD).qcow2
+DEBIAN_IMAGE_SHA_FILE ?= $(DEBIAN_IMAGE_FILE).sha512sum
+
+# DIST resolved variables
+IMAGE_BASE_URL ?= $($(call to_upper,$(DIST))_IMAGE_BASE_URL)
+IMAGE_FILE ?= $($(call to_upper,$(DIST))_IMAGE_FILE)
+IMAGE_SHA_FILE ?= $($(call to_upper,$(DIST))_IMAGE_SHA_FILE)
+IMAGE_SHA_SIZE ?= $(patsubst .sha%sum,%,$(suffix $(IMAGE_SHA_FILE)))
+
+#
+# defines
+#
+
+define download_and_verify
+$(1):
+	@echo "downloading $(2)"
+	mkdir -p $$(@D) && \
+	curl --retry 3 --connect-timeout 10 -o$$@.download -L $(2) && \
+	$$(PRINT_STATS_CMD) $$@.download && \
+	tar -xzOf $$@.download >/dev/null || { \
+		echo >&2 "error downloading"; \
+		exit 1; \
+	}
+	mv -f $$@.download $$@
+endef
+
+# image builder container image
+DOCKER_BUILD_IMAGE = scripts/.build-image-stamp-$(ARCH)
+DOCKER_BUILD_IMAGE_SOURCES = scripts/Dockerfile scripts/image.sh
+DOCKER_BUILD_IMAGE_TAG = colima-core-builder:$(ARCH)
+
+IMAGE_DEPENDENCIES = $(DOCKER_BUILD_IMAGE) $(CONTAINERD_ARCHIVE).sha512sum $(BINFMT_ARCHIVE).sha512sum
 #
 # targets
 #
 
-all: image
+.PHONY: clean distclean save-builder image $(RUNTIMES)
 
-.PHONY: clean
+# deprecated (default) target
+image: $(RUNTIME)
+
+all: $(RUNTIMES)
+
+# rm build targets
 clean:
+	rm -rf $(IMAGE_DEPENDENCIES) dist/img/*.raw.gz*
+
+# rm + cache
+distclean: clean
 	rm -rf dist
 
-cloud-image:
-	ARCH=$(ARCH) UBUNTU_VERSION=$(UBUNTU_VERSION) UBUNTU_CODENAME=$(UBUNTU_CODENAME) scripts/cloud-image.sh
+# base image
+$(IMAGE_FILE):
+	@echo "target: $@"
+	mkdir -p $(@D) && curl --retry 5 --connect-timeout 10 -o"$@" -L $(IMAGE_BASE_URL)/$(notdir $@)
 
-binfmt:
-	ARCH=$(ARCH) BINFMT_ARCH=$(BINFMT_ARCH) BINFMT_VERSION=$(BINFMT_VERSION) BINFMT_QEMU_VERSION=$(BINFMT_QEMU_VERSION) scripts/binfmt.sh
+$(IMAGE_SHA_FILE): $(IMAGE_FILE)
+	@echo "target: $@"
+	shasum -a $(IMAGE_SHA_SIZE) $< > $@.tmp
+	cd dist/img && ( \
+	    curl --retry 5 --connect-timeout 10 -L $(IMAGE_BASE_URL)/SHA$(IMAGE_SHA_SIZE)SUMS | \
+	    grep $(notdir $<) | \
+	    shasum -a $(IMAGE_SHA_SIZE) --check --status \
+	  ) || { \
+	    echo >&2 "checksum did not match!"; \
+	    rm -f $@.tmp; \
+	    mv -f $< $<.invalid; \
+	    exit 1; \
+	  }
+	mv $@.tmp $@
 
-containerd:
-	ARCH=$(ARCH) NERDCTL_VERSION=$(NERDCTL_VERSION) FLANNEL_VERSION=$(FLANNEL_VERSION) FLANNEL_MINI_VERSION=$(FLANNEL_MINI_VERSION) RUNTIME=$(RUNTIME) scripts/containerd.sh
+# checksum
+%.sha512sum: %
+	@echo "target: $@"
+	shasum -a 512 $< > $@
 
-image: cloud-image binfmt containerd
-	ARCH=$(ARCH) BINFMT_ARCH=$(BINFMT_ARCH) UBUNTU_VERSION=$(UBUNTU_VERSION) DOCKER_VERSION=$(DOCKER_VERSION) RUNTIME=$(RUNTIME) scripts/image.docker.sh
+# binfmt
+$(BINFMT_ARCHIVE): $(BINFMT_FILE) $(BINFMT_QEMU_FILE)
+	@echo "target: $@"
+	rm -f '$@'
+	TMP_DIR=$$(mktemp -d); \
+	  trap 'rm -rf "$$TMP_DIR"' EXIT; \
+	  for f in $^; do tar $(TARV)zxf "$$f" -C "$$TMP_DIR"; done; \
+	  cd "$$TMP_DIR" && tar $(TARV)czf '$(CURDIR)/$@' binfmt qemu-i386 qemu-$(BINFMT_ARCH) || { \
+	    echo >&2 "failed to create $@" ; \
+	    rm -f '$(CURDIR)/$@'; exit 1; \
+	  }
+
+$(eval $(call download_and_verify,$(BINFMT_FILE),$(BINFMT_URL)))
+$(eval $(call download_and_verify,$(BINFMT_QEMU_FILE),$(BINFMT_QEMU_URL)))
+
+# containerd
+$(CONTAINERD_ARCHIVE): $(NERDCTL_FILE) $(FLANNEL_FILE)
+	@echo "target: $@"
+	rm -f '$@'
+	TMP_DIR=$$(mktemp -d); \
+	  trap 'rm -rf "$$TMP_DIR"' EXIT; \
+	  for f in $^; do tar $(TARV)xzf "$$f" -C "$$TMP_DIR"; done; \
+	  cd "$$TMP_DIR" && tar $(TARV)czf '$(CURDIR)/$@' bin lib libexec share || { \
+	    echo >&2 "failed to create $@" ; \
+	    rm -f '$(CURDIR)/$@'; exit 1; \
+	  }
+
+$(eval $(call download_and_verify,$(NERDCTL_FILE),$(NERDCTL_URL)))
+$(eval $(call download_and_verify,$(FLANNEL_FILE),$(FLANNEL_URL)))
+
+# builder
+save-builder: $(DOCKER_BUILD_IMAGE)
+	docker save $(DOCKER_BUILD_IMAGE_TAG) -o builder-$(OS_ARCH).tar
+
+$(DOCKER_BUILD_IMAGE): $(DOCKER_BUILD_IMAGE_SOURCES) Makefile
+	docker build --platform linux/$(ARCH) --build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) -t $(DOCKER_BUILD_IMAGE_TAG) --iidfile $@ $(dir $@)
+
+# images
+$(basename $(IMAGE_FILE))-%.raw.gz: $(IMAGE_SHA_FILE) $(IMAGE_DEPENDENCIES) $(DOCKER_BUILD_IMAGE) Makefile
+	if [ $(OS_ARCH) != $(ARCH) ] ; then docker run $(DOCKER_RUN_ARGS) --privileged --rm tonistiigi/binfmt --install $(BINFMT_ARCH); fi
+	docker run $(DOCKER_RUN_ARGS) --rm --privileged \
+	  --platform linux/$(ARCH) \
+	  --volume $(CURDIR):/build \
+	  --env DIST=$(DIST) \
+	  --env BINFMT_ARCHIVE=$(BINFMT_ARCHIVE) \
+	  --env CONTAINERD_ARCHIVE=$(CONTAINERD_ARCHIVE) \
+	  --env IMAGE_FILE=$(IMAGE_FILE) \
+	  --env DOCKER_VERSION=$(DOCKER_VERSION) \
+	  --env RUNTIME=$* \
+	  $(DOCKER_BUILD_IMAGE_TAG) || { \
+	  echo >&2 "failed to create $@"; \
+	  rm -f '$@'* ; exit 1; \
+	}
+
+$(RUNTIMES): %: $(basename $(IMAGE_FILE))-%.raw.gz
+	$(PRINT_STATS_CMD) $<
